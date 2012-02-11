@@ -68,6 +68,8 @@ typedef memcached_return memcached_return_t;
 #endif
 
 struct hist;
+struct work_src;
+struct server_auxchain;
 
 struct client {
 	struct sockaddr_in6	addr;		/* inet address */
@@ -119,12 +121,14 @@ struct listen_cfg {
 struct genlist {
 	void			*data;
 	size_t			data_len;
+	bool			valid;
 	struct elist_head	node;
 };
 
 struct server_db_ops {
 	char	* (*pwdb_lookup)(const char *user);
-	bool	(*sharelog)(const char *rem_host, const char *username,
+	bool	(*sharelog)(struct server_auxchain *aux,
+			    const char *rem_host, const char *username,
 			    const char *our_result, const char *upstream_result,
 			    const char *reason, const char *solution);
 	bool	(*open)(void);
@@ -135,6 +139,18 @@ enum server_db_eng {
 	SDB_SQLITE,
 	SDB_MYSQL,
 	SDB_POSTGRESQL,
+};
+
+struct server_auxchain {
+	char			*rpc_url;
+	char			*rpc_userpass;
+	char			*db_stmt_auxsharelog;
+
+	int32_t			chain_id;
+	unsigned char		last_prevhash[32];
+	unsigned char		cur_prevhash[32];
+
+	struct elist_head	auxchains_node;
 };
 
 struct server {
@@ -176,7 +192,7 @@ struct server {
 	struct hist		*hist;
 	unsigned char		last_prevhash[32];
 	unsigned char		cur_prevhash[32];
-
+	
 	struct htab		*workers;
 	struct elist_head	work_log;
 	unsigned int		work_expire;
@@ -185,10 +201,14 @@ struct server {
 	unsigned int		cred_expire;
 
 	struct elist_head	lp_waiters;
+	struct event		ev_lp_keepalive;
+	int			lp_keepalive_interval;
 	bool			disable_lp;
 	bool			disable_roll_ntime;
 
 	memcached_st		*mc;
+
+	struct elist_head	auxchains;
 
 	struct elist_head	listeners;
 	struct elist_head	sockets;	/* points into listeners */
@@ -214,12 +234,14 @@ extern void hist_free(struct hist *hist);
 extern struct hist *hist_alloc(void);
 extern bool hist_add(struct hist *hist, const unsigned char *hash);
 extern bool hist_lookup(struct hist *hist, const unsigned char *hash);
+extern bool fetch_new_work(void);
 
 /* server.c */
 extern int debugging;
 extern bool use_syslog;
 extern struct server srv;
-extern void sharelog(const char *rem_host, const char *username,
+extern void sharelog(struct server_auxchain *aux,
+		     const char *rem_host, const char *username,
 		     const char *, const char *,
 		     const char *, const char *);
 extern bool cjson_encode(unsigned char op, const char *obj_unc,
@@ -241,6 +263,7 @@ extern json_t *json_rpc_call(CURL *curl, const char *url,
 		      const char *userpass, const char *rpc_req);
 extern char *bin2hex(unsigned char *p, size_t len);
 extern bool hex2bin(unsigned char *p, const char *hexstr, size_t len);
+extern size_t hex2bin_dyn(unsigned char **pp, const char *hexstr);
 extern unsigned char * g_base64_decode (const char *text, size_t *out_len);
 
 /* db-*.c */

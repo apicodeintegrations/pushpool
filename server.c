@@ -1,4 +1,3 @@
-
 /*
  * Copyright 2011 Jeff Garzik
  * Copyright 2009 Red Hat, Inc.
@@ -78,10 +77,17 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state);
 
 static const struct argp argp = { options, parse_opt, NULL, doc };
 
+typedef enum lp_type {
+	LP_NONE = 0,
+	LP_REPLY,
+	LP_KEEPALIVE,
+	LP_CLOSE,
+} lp_type;
+
 static bool server_running = true;
 static bool dump_stats;
 static bool reopen_logs;
-static bool initiate_lp_flush;
+static lp_type initiate_lp_flush;
 bool use_syslog = true;
 static bool strict_free = false;
 int debugging = 0;
@@ -661,7 +667,8 @@ static void reqlog(const char *rem_host, const char *username,
 	free(f);
 }
 
-void sharelog(const char *rem_host, const char *username,
+void sharelog(struct server_auxchain *aux,
+	      const char *rem_host, const char *username,
 	      const char *our_result, const char *upstream_result,
 	      const char *reason, const char *solution)
 {
@@ -671,7 +678,7 @@ void sharelog(const char *rem_host, const char *username,
 	struct tm tm;
 
 	if (srv.db_sharelog && srv.db_ops->sharelog != NULL)
-		srv.db_ops->sharelog(rem_host, username, our_result,
+		srv.db_ops->sharelog(aux, rem_host, username, our_result,
 				     upstream_result, reason, solution);
 
 	if (srv.share_fd < 0)
@@ -680,7 +687,7 @@ void sharelog(const char *rem_host, const char *username,
 	gettimeofday(&tv, NULL);
 	gmtime_r(&tv.tv_sec, &tm);
 
-	if (asprintf(&f, "[%d-%02d-%02d %02d:%02d:%02.6f] %s %s %s %s %s %s\n",
+	if (asprintf(&f, "[%d-%02d-%02d %02d:%02d:%02.6f] %s %s %s %s %s %s%s%s\n",
 		tm.tm_year + 1900,
 		tm.tm_mon + 1,
 		tm.tm_mday,
@@ -693,7 +700,8 @@ void sharelog(const char *rem_host, const char *username,
 	        (our_result && *our_result) ? our_result : "-",
 	        (upstream_result && *upstream_result) ? upstream_result : "-",
 	        (reason && *reason) ? reason : "-",
-		(solution && *solution) ? solution : "-") < 0)
+		(solution && *solution) ? solution : "-",
+		aux ? " " : "", aux ? aux->rpc_url : "") < 0)
 		return;
 
 	wrc = write(srv.share_fd, f, strlen(f));
@@ -703,9 +711,65 @@ void sharelog(const char *rem_host, const char *username,
 	free(f);
 }
 
-static void http_handle_req(struct evhttp_request *req, bool longpoll)
+static bool http_get_username(struct evhttp_request *req, char *username, bool headers_sent)
 {
-	const char *clen_str, *auth;
+	const char *auth;
+
+	auth = evhttp_find_header(req->input_headers, "Authorization");
+	if (!auth) {
+		reqlog(req->remote_host, username, req->uri);
+		if (!headers_sent) {
+			evhttp_add_header(req->output_headers, "WWW-Authenticate", "Basic realm=\"pool.itzod.ru\"");
+			evhttp_send_reply(req, 401, "not authorized", NULL);
+		}
+		return false;
+	}
+	if (!valid_auth_hdr(auth, username)) {
+		reqlog(req->remote_host, username, req->uri);
+		if (!headers_sent)
+			evhttp_send_reply(req, 403, "access forbidden", NULL);
+		return false;
+	}
+
+	return true;
+}
+
+static void http_set_headers(struct evhttp_request *req, struct server_socket *sock, bool longpoll)
+{
+	evhttp_clear_headers(req->output_headers);
+
+	/* Add header to debug load balancing */
+	if (srv.ourhost)
+		evhttp_add_header(req->output_headers, "X-Server", srv.ourhost);
+
+	/* copy X-Forwarded-For header to remote_host, if a trusted proxy provides it */
+	if (sock->cfg->proxy && !strcmp(req->remote_host, sock->cfg->proxy)) {
+		const char *hdr;
+		hdr = evhttp_find_header(req->input_headers, "X-Forwarded-For");
+		if (hdr) {
+			free(req->remote_host);
+			req->remote_host = strdup(hdr);
+		}
+	}
+
+	evhttp_add_header(req->output_headers,
+			  "Content-Type", "application/json");
+	if (!longpoll && !srv.disable_lp)
+		evhttp_add_header(req->output_headers, "X-Long-Polling", "/LP");
+	if (!srv.disable_roll_ntime)
+		evhttp_add_header(req->output_headers, "X-Roll-NTime", "Y");
+}
+
+static inline bool is_valid(bool *valid)
+{
+	if (valid && *valid)
+		return true;
+	return false;
+}
+
+static void http_handle_req(struct evhttp_request *req, lp_type longpoll, bool *req_valid)
+{
+	const char *clen_str;
 	char *body_str;
 	char username[65] = "";
 	void *body, *reply = NULL;
@@ -716,27 +780,16 @@ static void http_handle_req(struct evhttp_request *req, bool longpoll)
 	bool rc;
 	struct evbuffer *evbuf;
 
-	auth = evhttp_find_header(req->input_headers, "Authorization");
-	if (!auth) {
-		reqlog(req->remote_host, username, req->uri);
-		evhttp_add_header(req->output_headers, "WWW-Authenticate", "Basic realm=\"pushpool\"");
-		evhttp_send_reply(req, 401, "not authorized", NULL);
-		return;
-	}
-	if (!valid_auth_hdr(auth, username)) {
-		reqlog(req->remote_host, username, req->uri);
-		evhttp_send_reply(req, 403, "access forbidden", NULL);
-		return;
-	}
+	if (!http_get_username(req, username, req->chunked))
+ 		return;
 
-	if (!longpoll) {
+	if (longpoll == LP_NONE) {
 		clen_str = evhttp_find_header(req->input_headers, "Content-Length");
 		if (clen_str)
 			clen = atoi(clen_str);
 		if (clen < 1 || clen > 999999) {
 			reqlog(req->remote_host, username, req->uri);
-			evhttp_send_reply(req, HTTP_BADREQUEST, "invalid args", NULL);
-			return;
+			goto err_out_bad_req;
 		}
 
 		if (EVBUFFER_LENGTH(req->input_buffer) != clen)
@@ -745,22 +798,30 @@ static void http_handle_req(struct evhttp_request *req, bool longpoll)
 		body_str = strndup(body, clen);
 		if (!body_str)
 			goto err_out_bad_req;
-	} else /* long polling */
+	} else if (longpoll == LP_REPLY) {
 		body_str = strdup("{\"method\":\"getwork\",\"params\":[],\"id\":1}");
+	} else if (longpoll == LP_KEEPALIVE || longpoll == LP_CLOSE) {
+		reply = malloc(sizeof(char) * 2);
+		if (!reply)
+			goto err_out_bad_req;
+		reply_len = snprintf(reply, 2, " ");
+	}
 
-	jreq = JSON_LOADS(body_str, &jerr);
+	if (!reply) {
+		jreq = JSON_LOADS(body_str, &jerr);
 
-	free(body_str);
+		free(body_str);
 
-	if (!jreq)
-		goto err_out_bad_req;
+		if (!jreq)
+			goto err_out_bad_req;
 
-	rc = msg_json_rpc(req, jreq, username, &reply, &reply_len);
+		rc = msg_json_rpc(req, jreq, username, &reply, &reply_len);
 
-	json_decref(jreq);
+		json_decref(jreq);
 
-	if (!rc)
-		goto err_out_bad_req;
+		if (!rc)
+			goto err_out_bad_req;
+	}
 
 	evbuf = evbuffer_new();
 	if (!evbuf) {
@@ -775,36 +836,97 @@ static void http_handle_req(struct evhttp_request *req, bool longpoll)
 
 	free(reply);
 
-	evhttp_add_header(req->output_headers,
-			  "Content-Type", "application/json");
-	if (!longpoll && !srv.disable_lp)
-		evhttp_add_header(req->output_headers, "X-Long-Polling", "/LP");
-	if (!srv.disable_roll_ntime)
-		evhttp_add_header(req->output_headers, "X-Roll-NTime", srv.work_expire_str);
-	evhttp_send_reply(req, HTTP_OK, "ok", evbuf);
+	/* req_valid is a pointer to the valid member of the list struct
+	 * containing the LP request. When the connection drops and
+	 * http_lp_close_cb is called, this bool is set to false. Because we
+	 * have the reference, we can check before each send command if the
+	 * close callback has been called or if the request is still OK.
+	 *
+	 * We only have to check this when sending chunked, because if we send
+	 * in one go, there is nothing that could have closed the request, as
+	 * we're single threaded. For now.
+	 */
+	if (longpoll == LP_NONE) {
+		/* Send normal requests not chunked */
+		evhttp_send_reply(req, HTTP_OK, "ok", evbuf);
+	} else {
+		if (!req->chunked && is_valid(req_valid))
+			evhttp_send_reply_start(req, HTTP_OK, "ok");
+		if (is_valid(req_valid))
+			evhttp_send_reply_chunk(req, evbuf);
+		if (longpoll != LP_KEEPALIVE && is_valid(req_valid))
+			evhttp_send_reply_end(req);
+	}
 
 	evbuffer_free(evbuf);
 
 	return;
 
 err_out_bad_req:
-	evhttp_send_reply(req, HTTP_BADREQUEST, "invalid args", NULL);
+	/* When we've already sent headers, we can't really give an error so
+	 * we just send an empty reply...
+	 */
+	if (req->chunked) {
+		if (is_valid(req_valid))
+			evhttp_send_reply_end(req);
+	} else {
+		evhttp_send_reply(req, HTTP_BADREQUEST, "invalid args", NULL);
+	}
 }
 
-static void flush_lp_waiters(void)
+static void lp_keepalive_reset(struct event *ev, bool new)
+{
+	struct timeval tv;
+
+	if (srv.lp_keepalive_interval <= 0)
+		return;
+
+	tv.tv_sec = srv.lp_keepalive_interval;
+	tv.tv_usec = 0;
+
+	if (evtimer_pending(ev, NULL) == EV_TIMEOUT)
+		evtimer_del(ev);
+
+	if (new)
+		evtimer_add(ev, &tv);
+	return;
+}
+
+static void flush_lp_waiters(lp_type type)
 {
 	struct genlist *tmp, *iter;
+	char *lp_type_str[] = {"none", "reply", "keep-alive", "close"};
+ 
+	applog(LOG_DEBUG, "LP flush waiters: %s", lp_type_str[type]);
 
 	elist_for_each_entry_safe(tmp, iter, &srv.lp_waiters, node) {
 		struct evhttp_request *req;
 
 		req = tmp->data;
-		http_handle_req(req, true);
-
-		elist_del(&tmp->node);
-		memset(tmp, 0, sizeof(*tmp));
-		free(tmp);
+		if (req && tmp->valid)
+			http_handle_req(req, type, &tmp->valid);
+		if (type != LP_KEEPALIVE) {
+			if (req)
+				evhttp_connection_set_closecb(req->evcon, NULL, NULL);
+			elist_del(&tmp->node);
+			memset(tmp, 0, sizeof(*tmp));
+			free(tmp);
+		}
 	}
+	lp_keepalive_reset(&srv.ev_lp_keepalive, (type != LP_CLOSE));
+}
+
+void http_lp_close_cb(struct evhttp_connection *evcon, void *arg)
+{
+	struct genlist *list = (struct genlist *)arg;
+
+	/* We don't delete the list item in case we are iterating
+	 * over it just now in flush_lp_waiters. Instead, we set
+	 * the req to NULL so we know to not touch it anymore. It
+	 * will get deleted on LP.
+	 */
+	list->data = NULL;
+	list->valid = false;
 }
 
 static void __http_srv_event(struct evhttp_request *req, void *arg,
@@ -813,30 +935,11 @@ static void __http_srv_event(struct evhttp_request *req, void *arg,
 	struct server_socket *sock = arg;
 	const char *auth;
 	char username[65] = "";
+	
+	http_set_headers(req, sock, longpoll);
 
-	/* copy X-Forwarded-For header to remote_host, if a trusted proxy provides it */
-	if (sock->cfg->proxy && !strcmp(req->remote_host, sock->cfg->proxy)) {
-		const char *hdr;
-		hdr = evhttp_find_header(req->input_headers, "X-Forwarded-For");
-		if (hdr) {
-			free(req->remote_host);
-			req->remote_host = strdup(hdr);
-		}
-	}
-
-	/* validate user authorization */
-	auth = evhttp_find_header(req->input_headers, "Authorization");
-	if (!auth) {
-		reqlog(req->remote_host, username, req->uri);
-		evhttp_add_header(req->output_headers, "WWW-Authenticate", "Basic realm=\"pushpool\"");
-		evhttp_send_reply(req, 401, "not authorized", NULL);
+	if (!http_get_username(req, username, false))
 		return;
-	}
-	if (!valid_auth_hdr(auth, username)) {
-		reqlog(req->remote_host, username, req->uri);
-		evhttp_send_reply(req, 403, "access forbidden", NULL);
-		return;
-	}
 
 	reqlog(req->remote_host, username, req->uri);
 
@@ -847,14 +950,16 @@ static void __http_srv_event(struct evhttp_request *req, void *arg,
 			return;
 
 		gl->data = req;
+		gl->valid = true;
 		INIT_ELIST_HEAD(&gl->node);
 
+		evhttp_connection_set_closecb(req->evcon, http_lp_close_cb, gl);
 		elist_add_tail(&gl->node, &srv.lp_waiters);
 	}
 
 	/* otherwise, handle immediately */
 	else
-		http_handle_req(req, false);
+		http_handle_req(req, LP_NONE, NULL);
 }
 
 static void http_srv_event(struct evhttp_request *req, void *arg)
@@ -1129,7 +1234,7 @@ static void usr1_signal(int signo)
 	if (debugging)
 		applog(LOG_INFO, "USR1 signal received, flushing LP waiters");
 
-	initiate_lp_flush = true;
+	initiate_lp_flush = LP_REPLY;
 	event_loopbreak();
 }
 
@@ -1160,6 +1265,20 @@ static void stats_dump(void)
 
 #undef X
 
+static void lp_keepalive_cb(int fd, short what, void *arg)
+{
+	if (what != EV_TIMEOUT)
+		return;
+
+	applog(LOG_INFO, "Triggering LP keepalive");
+	lp_keepalive_reset(&srv.ev_lp_keepalive, false);
+
+	initiate_lp_flush = LP_KEEPALIVE;
+	event_loopbreak();
+
+	return;
+}
+
 static int main_loop(void)
 {
 	int rc = 0;
@@ -1176,9 +1295,10 @@ static int main_loop(void)
 			srv.req_fd = log_reopen(srv.req_fd, srv.req_log);
 			srv.share_fd = log_reopen(srv.share_fd, srv.share_log);
 		}
-		if (initiate_lp_flush) {
-			initiate_lp_flush = false;
-			flush_lp_waiters();
+		if (initiate_lp_flush != LP_NONE) {
+			fetch_new_work();
+			flush_lp_waiters(initiate_lp_flush);
+			initiate_lp_flush = LP_NONE;
 		}
 	}
 
@@ -1195,6 +1315,7 @@ int main (int argc, char *argv[])
 	INIT_ELIST_HEAD(&srv.sockets);
 	INIT_ELIST_HEAD(&srv.work_log);
 	INIT_ELIST_HEAD(&srv.lp_waiters);
+	INIT_ELIST_HEAD(&srv.auxchains);
 
 	/* isspace() and strcasecmp() consistency requires this */
 	setlocale(LC_ALL, "C");
@@ -1298,6 +1419,18 @@ int main (int argc, char *argv[])
 
 	applog(LOG_INFO, "initialized");
 
+	/* set up longpolling keep-alive timer */
+	if (srv.lp_keepalive_interval > 0) {
+		applog(LOG_INFO, "Enabling %ds LP keep-alive", srv.lp_keepalive_interval);
+		evtimer_set(&srv.ev_lp_keepalive, lp_keepalive_cb, NULL);
+		lp_keepalive_reset(&srv.ev_lp_keepalive, true);
+	}
+
+        if(!fetch_new_work() && !elist_empty(&srv.listeners)) {
+		applog(LOG_ERR, "error: using aux chains but getworkex not available");
+		exit(1);
+	}
+
 	rc = main_loop();
 
 	applog(LOG_INFO, "shutting down");
@@ -1312,7 +1445,7 @@ err_out:
 	closelog();
 
 	if (strict_free) {
-		flush_lp_waiters();
+		flush_lp_waiters(LP_CLOSE);
 		hist_free(srv.hist);
 		net_close();
 		curl_easy_cleanup(srv.curl);

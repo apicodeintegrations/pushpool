@@ -91,5 +91,16 @@
 	"work.expire" : 120,
 
 	# allow clients to update the ntime field of their work
-	"roll.ntime.disable" : false
+	"roll.ntime.disable" : false,
+	
+	"longpoll.keepalive" : 300,
+	
+	"auxchains" : [
+      {
+        "rpc.url" : "http://127.0.0.1:8332/", 
+        "rpc.user" : "user
+        "rpc.pass" : "strongpassword
+        "stmt.sharelog":"INSERT INTO shares_nc (rem_host, username, our_result, upstream_result, reason, solution) VALUES ($1, $2, $3, $4, $5, decode($6, 'hex'))"
+      }
+    ]
 }
