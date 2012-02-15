@@ -30,6 +30,7 @@
 #include <openssl/sha.h>
 #include <syslog.h>
 #include "server.h"
+#include "scrypt.h"
 
 /*
 struct block_header
@@ -806,14 +807,21 @@ static int check_hash(const char *remote_host, const char *auth_user,
 	for (i = 0; i < 128/4; i++)
 		data32[i] = bswap_32(data32[i]);
 
+/*
 	SHA256(data_out, 80, hash1);
 	SHA256(hash1, SHA256_DIGEST_LENGTH, blockhash_out);
+*/
 
+	scrypt_hash(data_out, blockhash_out);
+
+/*
 	if (hash32[7] != 0) {
 		*reason_out = "H-not-zero";
-		return 0;		/* work is invalid */
+		return 0;		// work is invalid 
 	}
-	if (blockhash_out[27] == 0)
+*/
+
+	if (blockhash_out[29] < 0x0f)
 		better_hash = true;
 
 	if (hist_lookup(srv.hist, blockhash_out)) {

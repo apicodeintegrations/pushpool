@@ -1,4 +1,4 @@
-bitcoin push-mining pool server.
+Scrypt-based *coins push-mining pool server with merged mining and local work generation support.
 
 Dependencies:
 	libevent		Event-driven async I/O

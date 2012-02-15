@@ -34,7 +34,7 @@
 #include <jansson.h>
 #include "server.h"
 
-#define EASY_TARGET "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000"
+#define EASY_TARGET "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000"
 
 static char *read_commented_file(const char *fn)
 {
@@ -452,7 +452,7 @@ void read_config(void)
 
 	if (json_is_true(json_object_get(jcfg, "rpc.target.rewrite")))
 		srv.easy_target = json_string(EASY_TARGET);
-
+	
 	tmp_json = json_object_get(jcfg, "work.expire");
 	if (json_is_integer(tmp_json))
 		srv.work_expire = json_integer_value(tmp_json);
