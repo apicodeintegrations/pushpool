@@ -32,18 +32,6 @@
 #include "server.h"
 #include "scrypt.h"
 
-/*
-struct block_header
-{
-	uint32_t version;
-	unsigned char prev_block[32];
-	unsigned char merkle_root[32];
-	uint32_t timestamp;
-	uint32_t bits;
-	uint32_t nonce;
-};
-*/
-
 struct work_aux;
 
 struct work_src
@@ -88,16 +76,6 @@ struct work_ent {
 
 	struct elist_head	log_node;
 	struct elist_head	srv_log_node;
-};
-
-static const char *bc_err_str[] = {
-	[BC_ERR_NONE] = "no error (success)",
-	[BC_ERR_INVALID] = "invalid parameter",
-	[BC_ERR_AUTH] = "auth failed: invalid user or pass",
-	[BC_ERR_CONFIG] = "invalid configuration",
-	[BC_ERR_RPC] = "upstream RPC problem",
-	[BC_ERR_WORK_REJECT] = "work submit rejected upstream",
-	[BC_ERR_INTERNAL] = "internal server err",
 };
 
 static struct work_aux *work_aux_alloc(struct server_auxchain *aux) {
@@ -302,31 +280,6 @@ static bool jobj_binary(const json_t *obj, const char *key,
 	return true;
 }
 
-static bool work_decode(const json_t *val, struct bc_work *work)
-{
-	if (!jobj_binary(val, "midstate",
-			 work->midstate, sizeof(work->midstate))) {
-		goto err_out;
-	}
-
-	if (!jobj_binary(val, "data", work->data, sizeof(work->data))) {
-		goto err_out;
-	}
-
-	if (!jobj_binary(val, "hash1", work->hash1, sizeof(work->hash1))) {
-		goto err_out;
-	}
-
-	if (!jobj_binary(val, "target", work->target, sizeof(work->target))) {
-		goto err_out;
-	}
-
-	return true;
-
-err_out:
-	return false;
-}
-
 // rebuilds the merkle tree and block header after modifying the coinbase
 static void rebuild_merkle_tree(struct work_src* work, unsigned char data_out[128])
 {
@@ -360,7 +313,6 @@ static unsigned int rpcid = 1;
 
 static struct work_src *current_work = NULL;
 static uint32_t our_nonce_ctr = 0;
-static time_t current_work_expires = 0;
 
 static void calc_midstate(unsigned char *data, uint32_t *midstate_out)
 {
@@ -384,10 +336,12 @@ static json_t *get_work(const char *auth_user)
 	const char *data_str;
 	json_t *val, *result;
 
-	if(current_work != NULL && time(NULL) > current_work_expires)
-		fetch_new_work();
 
-	if(current_work != NULL && !srv.disable_lp && srv.easy_target) {
+	if(!srv.disable_lp && srv.easy_target) {
+		if(current_work == NULL)
+			if(!fetch_new_work())
+				return NULL;
+
 		uint32_t our_nonce = our_nonce_ctr++;
 		uint32_t midstate[8];
 		set_our_nonce(current_work, our_nonce);
@@ -733,7 +687,6 @@ bool fetch_new_work(void)
 		unsigned char auxmerkleroot[32];
 
 		current_work = get_work_ex();
-		current_work_expires = time(NULL) + 5;
 		if(current_work == NULL)
 			return false;
 
@@ -780,12 +733,25 @@ bool fetch_new_work(void)
 	}
 }
 
+static int hash_greater_target(const unsigned char *hash, const unsigned char *target)
+{
+	int i;
+
+	for (i = 31; i >= 0; i--) {
+		if (hash[i] > target[i])
+			return 1;
+
+		if (hash[i] < target[i])
+			return 0;
+	}
+	return 0;
+}
+
 static int check_hash(const char *remote_host, const char *auth_user,
 		      const char *data_str, const char **reason_out,
                       uint32_t *our_nonce_out, struct work_src **work_src_out,
                       unsigned char *data_out, unsigned char *blockhash_out)
 {
-	unsigned char hash1[SHA256_DIGEST_LENGTH];
 	uint32_t *hash32 = (uint32_t *) blockhash_out;
 	uint32_t *data32 = (uint32_t *) data_out;
 	bool rc, better_hash = false;
@@ -807,21 +773,15 @@ static int check_hash(const char *remote_host, const char *auth_user,
 	for (i = 0; i < 128/4; i++)
 		data32[i] = bswap_32(data32[i]);
 
-/*
-	SHA256(data_out, 80, hash1);
-	SHA256(hash1, SHA256_DIGEST_LENGTH, blockhash_out);
-*/
-
 	scrypt_hash(data_out, blockhash_out);
-
-/*
-	if (hash32[7] != 0) {
-		*reason_out = "H-not-zero";
-		return 0;		// work is invalid 
+	
+	if(hash_greater_target(blockhash_out, srv.easy_target_bin))
+	{
+		*reason_out = "invalid";
+		return 0;
 	}
-*/
 
-	if (blockhash_out[29] < 0x0f)
+	if (blockhash_out[28] == 0)
 		better_hash = true;
 
 	if (hist_lookup(srv.hist, blockhash_out)) {
@@ -1059,202 +1019,6 @@ static bool submit_bin_work(const char *remote_host, const char *auth_user,
 
 out:
 	return rc;
-}
-
-static bool cli_config(struct client *cli, const json_t *cfg)
-{
-	/* FIXME */
-	return false;
-}
-
-bool cli_op_login(struct client *cli, const json_t *obj, unsigned int msgsz)
-{
-	char user[33];
-	char *pass;
-	json_t *cfg, *resobj, *res_cfgobj;
-	int version, err_code = BC_ERR_INTERNAL;
-	bool rc;
-	SHA256_CTX ctx;
-	unsigned char md[SHA256_DIGEST_LENGTH];
-
-	/* verify client protocol version */
-	version = json_integer_value(json_object_get(obj, "version"));
-	if (version < 1 || version > 1) {
-		err_code = BC_ERR_INVALID;
-		goto err_out;
-	}
-
-	/* read username, and retrieve associated password from database */
-	strncpy(user, json_string_value(json_object_get(obj, "user")),
-		sizeof(user));
-	user[sizeof(user) - 1] = 0;
-
-	pass = pwdb_lookup(user);
-	if (!pass) {
-		applog(LOG_WARNING, "unknown user %s", user);
-		err_code = BC_ERR_AUTH;
-		goto err_out;
-	}
-
-	/* calculate sha256(login JSON packet + user password) */
-	SHA256_Init(&ctx);
-	SHA256_Update(&ctx, cli->msg, msgsz - SHA256_DIGEST_LENGTH);
-	SHA256_Update(&ctx, pass, strlen(pass));
-	SHA256_Final(md, &ctx);
-
-	free(pass);
-
-	/* compare sha256 sum with LOGIN msg trailer */
-	if (memcmp(md, cli->msg + (msgsz - SHA256_DIGEST_LENGTH),
-		   SHA256_DIGEST_LENGTH)) {
-		applog(LOG_WARNING, "invalid password for user %s", user);
-		err_code = BC_ERR_AUTH;
-		goto err_out;
-	}
-
-	/* apply requested configuration options */
-	cfg = json_object_get(obj, "config");
-	if (json_is_object(cfg) && !cli_config(cli, cfg)) {
-		err_code = BC_ERR_CONFIG;
-		goto err_out;
-	}
-
-	/* build result object, describing server setup */
-	res_cfgobj = json_object();
-	resobj = json_object();
-	if (json_object_set_new(resobj, "version", json_integer(1)) ||
-	    json_object_set_new(resobj, "server-name",
-	    			json_string(PACKAGE)) ||
-	    json_object_set_new(resobj, "server-version",
-	    			json_string(VERSION)) ||
-	    json_object_set_new(resobj, "config", res_cfgobj)) {
-		json_decref(res_cfgobj);
-		goto err_out_resobj;
-	}
-
-	rc = cli_send_obj(cli, BC_OP_LOGIN_RESP, resobj);
-
-	json_decref(resobj);
-
-	if (rc) {
-		strcpy(cli->auth_user, user);
-		cli->logged_in = true;
-	}
-
-	return rc;
-
-err_out_resobj:
-	json_decref(resobj);
-err_out:
-	cli_send_err(cli, BC_OP_LOGIN_RESP, err_code, bc_err_str[err_code]);
-	return false;
-}
-
-bool cli_op_config(struct client *cli, const json_t *cfg)
-{
-	json_t *res;
-	bool rc;
-
-	/* apply requested configuration options */
-	if (json_is_object(cfg) && !cli_config(cli, cfg)) {
-		cli_send_err(cli, BC_OP_CONFIG_RESP, BC_ERR_CONFIG,
-			     bc_err_str[BC_ERR_CONFIG]);
-		return false;
-	}
-
-	/* build result object, describing configuration.
-	 * this is the 'config' object returned from
-	 * BC_OP_LOGIN_RESP
-	 */
-	res = json_object();
-
-	rc = cli_send_obj(cli, BC_OP_CONFIG_RESP, res);
-
-	json_decref(res);
-
-	return rc;
-}
-
-bool cli_op_work_get(struct client *cli, unsigned int msgsz)
-{
-	json_t *val;
-	int err_code = BC_ERR_INVALID;
-	struct ubbp_header *msg_hdr;
-	struct bc_work work;
-	void *raw_msg;
-	size_t msg_len;
-	bool rc;
-
-	if (msgsz > 0)
-		return false;
-
-	/* obtain work from upstream server */
-	val = get_work(cli->auth_user);
-	if (!val) {
-		err_code = BC_ERR_RPC;
-		goto err_out;
-	}
-
-	/* decode result into work state struct */
-	rc = work_decode(val, &work);
-
-	json_decref(val);
-
-	if (!rc) {
-		err_code = BC_ERR_RPC;
-		goto err_out;
-	}
-
-	/* alloc new message buffer */
-	msg_len = sizeof(struct ubbp_header) + sizeof(struct bc_work);
-
-	raw_msg = calloc(1, msg_len);
-	if (!raw_msg) {
-		err_code = BC_ERR_INTERNAL;
-		goto err_out;
-	}
-
-	/* build BC_OP_WORK message: hdr + bc_work */
-	msg_hdr = raw_msg;
-	memcpy(msg_hdr->magic, PUSHPOOL_UBBP_MAGIC, 4);
-	msg_hdr->op_size = htole32(UBBP_OP_SIZE(BC_OP_WORK,
-						sizeof(struct bc_work)));
-	memcpy(raw_msg + sizeof(struct ubbp_header),
-	       &work, sizeof(struct bc_work));
-
-	rc = cli_send_msg(cli, raw_msg, msg_len);
-
-	free(raw_msg);
-
-	return rc;
-
-err_out:
-	cli_send_err(cli, BC_OP_RESP_ERR, err_code, bc_err_str[err_code]);
-	return false;
-}
-
-bool cli_op_work_submit(struct client *cli, unsigned int msgsz)
-{
-	int err_code = BC_ERR_INVALID;
-	const char *reason;
-
-	if (msgsz != 128)
-		goto err_out;
-	if (!submit_bin_work(cli->addr_host, cli->auth_user,
-			     srv.curl, cli->msg, &reason)) {
-		err_code = BC_ERR_RPC;
-		goto err_out;
-	}
-	if (reason) {
-		err_code = BC_ERR_WORK_REJECT;
-		goto err_out;
-	}
-
-	return cli_send_hdronly(cli, BC_OP_RESP_OK);
-
-err_out:
-	cli_send_err(cli, BC_OP_RESP_ERR, err_code, bc_err_str[err_code]);
-	return false;
 }
 
 static json_t *json_rpc_errobj(int code, const char *msg)

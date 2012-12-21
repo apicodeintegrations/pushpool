@@ -157,425 +157,6 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-static json_t *cjson_decode(void *buf, size_t buflen)
-{
-	json_t *obj = NULL;
-	json_error_t err;
-	void *obj_unc = NULL;
-	unsigned long dest_len;
-	void *comp_p;
-	uint32_t unc_len;
-	unsigned char zero = 0;
-
-	if (buflen < 6)
-		return NULL;
-
-	/* look at first 32 bits of buffer, which contains uncompressed len */
-	unc_len = le32toh(*((uint32_t *)buf));
-	if (unc_len > CLI_MAX_MSG)
-		return NULL;
-
-	/* alloc buffer for uncompressed data */
-	obj_unc = malloc(unc_len + 1);
-	if (!obj_unc)
-		return NULL;
-	dest_len = unc_len;
-
-	/* decompress buffer (excluding first 32 bits) */
-	comp_p = buf + 4;
-	if (uncompress(obj_unc, &dest_len, comp_p, buflen - 4) != Z_OK)
-		goto out;
-	if (dest_len != unc_len)
-		goto out;
-	memcpy(obj_unc + unc_len, &zero, 1);	/* null terminate */
-
-	/* attempt JSON decode of buffer */
-	obj = JSON_LOADS(obj_unc, &err);
-
-out:
-	free(obj_unc);
-
-	return obj;
-}
-
-bool cjson_encode(unsigned char op, const char *obj_unc,
-		  void **buf_out, size_t *buflen_out)
-{
-	void *obj_comp, *raw_msg = NULL;
-	uint32_t *obj_clen;
-	struct ubbp_header *msg_hdr;
-	unsigned long comp_len;
-	size_t payload_len;
-	size_t unc_len = strlen(obj_unc);
-
-	*buf_out = NULL;
-	*buflen_out = 0;
-
-	/* create buffer for entire msg (header + contents), assuming
-	 * a worst case where compressed data may be slightly larger than
-	 * input data
-	 */
-	raw_msg = calloc(1, unc_len + 64);
-	if (!raw_msg)
-		goto err_out;
-
-	/* get ptr to uncompressed-length value, which follows header */
-	obj_clen = raw_msg + sizeof(struct ubbp_header);
-
-	/* get ptr to compressed data area, which follows hdr & uncompr. len */
-	obj_comp = raw_msg + sizeof(struct ubbp_header) + sizeof(uint32_t);
-
-	/* compress data */
-	comp_len = unc_len + 64 -
-		(sizeof(struct ubbp_header) + sizeof(uint32_t));
-	if (compress2(obj_comp, &comp_len,
-		      (Bytef *) obj_unc, unc_len, 9) != Z_OK)
-		goto err_out;
-
-	/* fill in UBBP message header */
-	msg_hdr = raw_msg;
-	memcpy(msg_hdr->magic, PUSHPOOL_UBBP_MAGIC, 4);
-	payload_len = sizeof(uint32_t) + comp_len;
-	msg_hdr->op_size = htole32(UBBP_OP_SIZE(op, payload_len));
-
-	/* fill in uncompressed length */
-	*obj_clen = htole32(unc_len);
-
-	/* return entire message */
-	*buf_out = raw_msg;
-	*buflen_out = sizeof(struct ubbp_header) + payload_len;
-
-	return true;
-
-err_out:
-	free(raw_msg);
-	return false;
-}
-
-bool cjson_encode_obj(unsigned char op, const json_t *obj,
-		      void **buf_out, size_t *buflen_out)
-{
-	char *obj_unc;
-	bool rc;
-
-	*buf_out = NULL;
-	*buflen_out = 0;
-
-	/* encode JSON object to flat string */
-	obj_unc = json_dumps(obj, JSON_COMPACT | JSON_SORT_KEYS);
-	if (!obj_unc)
-		return false;
-
-	/* build message, with compressed JSON payload */
-	rc = cjson_encode(op, obj_unc, buf_out, buflen_out);
-
-	free(obj_unc);
-
-	return rc;
-}
-
-static void cli_free(struct client *cli)
-{
-	if (!cli)
-		return;
-
-	if (cli->ev_mask && (event_del(&cli->ev) < 0))
-		applog(LOG_ERR, "TCP cli poll del failed");
-
-	/* clean up network socket */
-	if (cli->fd >= 0) {
-		if (close(cli->fd) < 0)
-			syslogerr("close(2) TCP client socket");
-	}
-
-	if (debugging)
-		applog(LOG_DEBUG, "client %s ended", cli->addr_host);
-
-	tcp_read_free(&cli->rst);
-
-	free(cli->msg);
-
-	memset(cli, 0, sizeof(*cli));	/* poison */
-	free(cli);
-}
-
-static struct client *cli_alloc(int fd, struct sockaddr_in6 *addr,
-				socklen_t addrlen, bool have_http)
-{
-	struct client *cli;
-
-	cli = calloc(1, sizeof(*cli));
-	if (!cli)
-		return NULL;
-
-	cli->fd = fd;
-	memcpy(&cli->addr, addr, addrlen);
-	tcp_read_init(&cli->rst, cli->fd, cli);
-
-	return cli;
-}
-
-bool cli_send_msg(struct client *cli, const void *msg, size_t msg_len)
-{
-	ssize_t wrc;
-
-	/* send packet to client.  fail on all cases where
-	 * message is not transferred entirely into the
-	 * socket buffer on this write(2) call
-	 */
-	wrc = write(cli->fd, msg, msg_len);
-
-	return (wrc == msg_len);
-}
-
-bool cli_send_hdronly(struct client *cli, unsigned char op)
-{
-	struct ubbp_header hdr;
-
-	memcpy(&hdr.magic, PUSHPOOL_UBBP_MAGIC, 4);
-	hdr.op_size = htole32(UBBP_OP_SIZE(op, 0));
-
-	return cli_send_msg(cli, &hdr, sizeof(hdr));
-}
-
-bool cli_send_obj(struct client *cli, unsigned char op, const json_t *obj)
-{
-	void *raw_msg = NULL;
-	size_t msg_len;
-	bool rc = false;
-
-	/* create compressed message packet */
-	if (!cjson_encode_obj(op, obj, &raw_msg, &msg_len))
-		goto out;
-
-	rc = cli_send_msg(cli, raw_msg, msg_len);
-
-out:
-	free(raw_msg);
-	return rc;
-}
-
-bool cli_send_err(struct client *cli, unsigned char op,
-		  int err_code, const char *err_msg)
-{
-	char *s = NULL;
-	void *raw_msg = NULL;
-	size_t msg_len;
-	bool rc = false;
-
-	/* build JSON error string, strangely similar to JSON-RPC */
-	if (asprintf(&s, "{ \"error\" : { \"code\":%d, \"message\":\"%s\"}}",
-		     err_code, err_msg) < 0) {
-		applog(LOG_ERR, "OOM");
-		return false;
-	}
-
-	/* create compressed message packet */
-	if (!cjson_encode(op, s, &raw_msg, &msg_len))
-		goto out;
-
-	rc = cli_send_msg(cli, raw_msg, msg_len);
-
-out:
-	free(raw_msg);
-	free(s);
-	return rc;
-}
-
-static bool cli_msg(struct client *cli)
-{
-	uint32_t op = UBBP_OP(cli->ubbp.op_size);
-	uint32_t size = UBBP_SIZE(cli->ubbp.op_size);
-	json_t *obj = NULL;
-	bool rc = false;
-
-	/* LOGIN must always be first msg from client */
-	if (!cli->logged_in && (op != BC_OP_LOGIN))
-		return false;
-	else if (cli->logged_in && (op == BC_OP_LOGIN))
-		return false;
-
-	/* decode JSON messages, for opcodes that require it */
-	switch (op) {
-	case BC_OP_LOGIN:
-	case BC_OP_CONFIG: {
-		uint32_t cjson_len = size;
-
-		/* LOGIN is special; it has a sha256 digest
-		 * following the compressed JSON bytes
-		 */
-		if (op == BC_OP_LOGIN) {
-			if (size <= SHA256_DIGEST_LENGTH)
-				return false;
-			cjson_len -= SHA256_DIGEST_LENGTH;
-		}
-
-		obj = cjson_decode(cli->msg, cjson_len);
-		if (!json_is_object(obj))
-			goto out;
-		break;
-	}
-
-	default:
-		/* do nothing */
-		break;
-	}
-
-	/* message processing, determined by opcode */
-	switch (op) {
-	case BC_OP_NOP:
-		if (size > 0)
-			break;
-		rc = cli_send_hdronly(cli, BC_OP_NOP);
-		break;
-	case BC_OP_LOGIN:
-		rc = cli_op_login(cli, obj, size);
-		break;
-	case BC_OP_CONFIG:
-		rc = cli_op_config(cli, obj);
-		break;
-	case BC_OP_WORK_GET:
-		rc = cli_op_work_get(cli, size);
-		break;
-	case BC_OP_WORK_SUBMIT:
-		rc = cli_op_work_submit(cli, size);
-		break;
-
-	default:
-		/* invalid op.  fall through to function return stmt */
-		break;
-	}
-
-out:
-	json_decref(obj);
-
-	return rc;
-}
-
-static bool cli_read_msg(void *rst_priv, void *priv,
-			 unsigned int buflen, bool success)
-{
-	struct client *cli = rst_priv;
-	if (!success)
-		return false;
-
-	return cli_msg(cli);
-}
-
-static bool cli_read_hdr(void *rst_priv, void *priv,
-			 unsigned int buflen, bool success)
-{
-	struct client *cli = rst_priv;
-	uint32_t size;
-
-	if (!success)
-		return false;
-
-	if (memcmp(cli->ubbp.magic, PUSHPOOL_UBBP_MAGIC, 4))
-		return false;
-	cli->ubbp.op_size = le32toh(cli->ubbp.op_size);
-	size = UBBP_SIZE(cli->ubbp.op_size);
-	if (size > CLI_MAX_MSG)
-		return false;
-
-	if (size == 0)
-		return cli_msg(cli);
-
-	cli->msg = malloc(size);
-	if (!cli->msg)
-		return false;
-
-	return tcp_read(&cli->rst, cli->msg, size, cli_read_msg, NULL);
-}
-
-static void tcp_cli_event(int fd, short events, void *userdata)
-{
-	struct client *cli = userdata;
-	bool ok = true;
-
-	if (events & EV_READ)
-		ok = tcp_read_runq(&cli->rst);
-	if (events & EV_TIMEOUT)
-		ok = false;
-
-	if (!ok)
-		cli_free(cli);
-}
-
-static void tcp_srv_event(int fd, short events, void *userdata)
-{
-	struct server_socket *sock = userdata;
-	struct sockaddr_in6 addr;
-	socklen_t addrlen = sizeof(struct sockaddr_in6);
-	struct client *cli = NULL;
-	char host[64];
-	char port[16];
-	int cli_fd, on = 1;
-	struct timeval timeout = { CLI_RD_TIMEOUT, 0 };
-
-	/* receive TCP connection from kernel */
-	cli_fd = accept(sock->fd, (struct sockaddr *) &addr, &addrlen);
-	if (cli_fd < 0) {
-		syslogerr("tcp accept");
-		goto err_out;
-	}
-
-	srv.stats.tcp_accept++;
-
-	cli = cli_alloc(cli_fd, &addr, addrlen, true);
-	if (!cli) {
-		applog(LOG_ERR, "OOM");
-		close(cli_fd);
-		return;
-	}
-
-	/* mark non-blocking, for upcoming poll use */
-	if (fsetflags("tcp client", cli->fd, O_NONBLOCK) < 0)
-		goto err_out_fd;
-
-	/* disable delay of small output packets */
-	if (setsockopt(cli->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0)
-		applog(LOG_WARNING, "TCP_NODELAY failed: %s",
-		       strerror(errno));
-
-	/* turn on TCP keep-alive */
-	on = 1;
-	if (setsockopt(cli->fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0)
-		applog(LOG_WARNING, "SO_KEEPALIVE failed: %s",
-		       strerror(errno));
-
-	event_set(&cli->ev, cli->fd, EV_READ | EV_PERSIST,
-		  tcp_cli_event, cli);
-
-	/* pretty-print incoming cxn info */
-	getnameinfo((struct sockaddr *) &cli->addr, addrlen,
-		    host, sizeof(host), port, sizeof(port),
-		    NI_NUMERICHOST | NI_NUMERICSERV);
-	host[sizeof(host) - 1] = 0;
-	port[sizeof(port) - 1] = 0;
-	applog(LOG_INFO, "client host %s port %s connected%s", host, port,
-		false ? " via SSL" : "");
-
-	strcpy(cli->addr_host, host);
-	strcpy(cli->addr_port, port);
-
-	if (event_add(&cli->ev, &timeout) < 0) {
-		applog(LOG_ERR, "unable to ready cli fd for polling");
-		goto err_out_fd;
-	}
-	cli->ev_mask = EV_READ;
-
-	if (!tcp_read(&cli->rst, &cli->ubbp, sizeof(cli->ubbp),
-		      cli_read_hdr, NULL))
-		goto err_out_fd;
-
-	return;
-
-err_out_fd:
-err_out:
-	cli_free(cli);
-}
-
 static bool valid_auth_hdr(const char *hdr, char *username_out)
 {
 	char *t_type = NULL;
@@ -892,6 +473,22 @@ static void lp_keepalive_reset(struct event *ev, bool new)
 	return;
 }
 
+static void fetch_new_work_reset(struct event *ev, bool new)
+{
+	struct timeval tv;
+
+	tv.tv_sec = rand() % 10 + 1;
+	tv.tv_usec = 0;
+
+	if (evtimer_pending(ev, NULL) == EV_TIMEOUT)
+		evtimer_del(ev);
+
+	if (new)
+		evtimer_add(ev, &tv);
+	return;
+}
+
+
 static void flush_lp_waiters(lp_type type)
 {
 	struct genlist *tmp, *iter;
@@ -1076,28 +673,20 @@ static int net_open_socket(const struct listen_cfg *cfg,
 	sock->fd = fd;
 	sock->cfg = cfg;
 
-	if (have_http) {
-		sock->http = evhttp_new(srv.evbase_main);
-		if (!sock->http)
-			goto err_out_sock;
+	sock->http = evhttp_new(srv.evbase_main);
+	if (!sock->http)
+		goto err_out_sock;
 
-		if (evhttp_accept_socket(sock->http, fd) < 0) {
-			evhttp_free(sock->http);
-			goto err_out_sock;
-		}
-
-		evhttp_set_cb(sock->http, "/",
-			      http_srv_event, sock);
-		if (!srv.disable_lp)
-			evhttp_set_cb(sock->http, "/LP",
-				      http_srv_event_lp,sock);
-	} else {
-		event_set(&sock->ev, fd, EV_READ | EV_PERSIST,
-			  tcp_srv_event, sock);
-
-		if (event_add(&sock->ev, NULL) < 0)
-			goto err_out_sock;
+	if (evhttp_accept_socket(sock->http, fd) < 0) {
+		evhttp_free(sock->http);
+		goto err_out_sock;
 	}
+
+	evhttp_set_cb(sock->http, "/",
+		      http_srv_event, sock);
+	if (!srv.disable_lp)
+		evhttp_set_cb(sock->http, "/LP",
+		      http_srv_event_lp,sock);
 
 	elist_add_tail(&sock->sockets_node, &srv.sockets);
 
@@ -1279,6 +868,19 @@ static void lp_keepalive_cb(int fd, short what, void *arg)
 	return;
 }
 
+static void fetch_new_work_cb(int fd, short what, void *arg)
+{
+	if (what != EV_TIMEOUT)
+		return;
+
+	applog(LOG_INFO, "Fetching new work");
+	fetch_new_work();
+	fetch_new_work_reset(&srv.ev_fetch_new_work, true);
+	//event_loopbreak();
+
+	return;
+}
+
 static int main_loop(void)
 {
 	int rc = 0;
@@ -1296,7 +898,13 @@ static int main_loop(void)
 			srv.share_fd = log_reopen(srv.share_fd, srv.share_log);
 		}
 		if (initiate_lp_flush != LP_NONE) {
-			fetch_new_work();
+
+			if(initiate_lp_flush == LP_REPLY)
+			{
+			    fetch_new_work();
+			    fetch_new_work_reset(&srv.ev_fetch_new_work, true);
+			}
+
 			flush_lp_waiters(initiate_lp_flush);
 			initiate_lp_flush = LP_NONE;
 		}
@@ -1424,6 +1032,13 @@ int main (int argc, char *argv[])
 		applog(LOG_INFO, "Enabling %ds LP keep-alive", srv.lp_keepalive_interval);
 		evtimer_set(&srv.ev_lp_keepalive, lp_keepalive_cb, NULL);
 		lp_keepalive_reset(&srv.ev_lp_keepalive, true);
+	}
+
+	/* set up fetch_new_work timer */
+	if (srv.easy_target) {
+		applog(LOG_INFO, "Enabling fetch_new_work timer");
+		evtimer_set(&srv.ev_fetch_new_work, fetch_new_work_cb, NULL);
+		fetch_new_work_reset(&srv.ev_fetch_new_work, true);
 	}
 
         if(!fetch_new_work() && !elist_empty(&srv.listeners)) {

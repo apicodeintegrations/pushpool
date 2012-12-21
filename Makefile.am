@@ -7,7 +7,7 @@ INCLUDES	= -fno-strict-aliasing $(PTHREAD_FLAGS) @SQLITE3_CFLAGS@ \
 sbin_SCRIPTS	= blkmond
 sbin_PROGRAMS	= pushpoold
 
-pushpoold_SOURCES = anet.h elist.h htab.h protocol.h server.h ubbp.h	\
+pushpoold_SOURCES = anet.h elist.h htab.h server.h \
 		    hist.c htab.c anet.c config.c msg.c server.c util.c \
 		    db-sqlite.c db-mysql.c db-postgresql.c scrypt.h scrypt.c
 pushpoold_LDFLAGS = $(PTHREAD_FLAGS)

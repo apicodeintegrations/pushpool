@@ -138,14 +138,7 @@ static void parse_listen(const json_t *listeners)
 			exit(1);
 		}
 
-		lc->proto = LP_BC_BINARY;
-		proto_str = json_string_value(json_object_get(obj, "protocol"));
-		if (proto_str) {
-			if (!strcmp(proto_str, "http-json"))
-				lc->proto = LP_HTTP_JSON;
-			else if (!strcmp(proto_str, "binary"))
-				lc->proto = LP_BC_BINARY;
-		}
+		lc->proto = LP_HTTP_JSON;
 
 		INIT_ELIST_HEAD(&lc->listeners_node);
 
@@ -451,8 +444,11 @@ void read_config(void)
 	}
 
 	if (json_is_true(json_object_get(jcfg, "rpc.target.rewrite")))
+	{
+		hex2bin(srv.easy_target_bin, EASY_TARGET, 32);
 		srv.easy_target = json_string(EASY_TARGET);
-	
+	}
+
 	tmp_json = json_object_get(jcfg, "work.expire");
 	if (json_is_integer(tmp_json))
 		srv.work_expire = json_integer_value(tmp_json);

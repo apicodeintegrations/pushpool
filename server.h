@@ -30,8 +30,6 @@
 #include <curl/curl.h>
 #include <libmemcached/memcached.h>
 #include "elist.h"
-#include "ubbp.h"
-#include "protocol.h"
 #include "anet.h"
 #include "htab.h"
 
@@ -84,8 +82,6 @@ struct client {
 	bool			logged_in;
 	char			auth_user[33];	/* authenticated username */
 
-	struct ubbp_header	ubbp;
-
 	void			*msg;
 };
 
@@ -105,7 +101,6 @@ struct server_socket {
 };
 
 enum listen_protocol {
-	LP_BC_BINARY,
 	LP_HTTP_JSON,
 };
 
@@ -175,6 +170,7 @@ struct server {
 	char			*rpc_url;
 	char			*rpc_userpass;
 	json_t			*easy_target;
+	char			easy_target_bin[32];
 
 	enum server_db_eng	db_eng;
 	struct server_db_ops	*db_ops;
@@ -202,6 +198,7 @@ struct server {
 
 	struct elist_head	lp_waiters;
 	struct event		ev_lp_keepalive;
+	struct event		ev_fetch_new_work;
 	int			lp_keepalive_interval;
 	bool			disable_lp;
 	bool			disable_roll_ntime;
